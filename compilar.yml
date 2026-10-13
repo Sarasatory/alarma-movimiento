@@ -1,0 +1,672 @@
+name: Compilar APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+      - name: Crear el proyecto
+        run: |
+          mkdir -p app/src/main/java/es/alarma/movimiento
+          cat > settings.gradle <<'FIN_DEL_ARCHIVO'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AlarmaMovimiento"
+          include ':app'
+          FIN_DEL_ARCHIVO
+          cat > build.gradle <<'FIN_DEL_ARCHIVO'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          FIN_DEL_ARCHIVO
+          cat > gradle.properties <<'FIN_DEL_ARCHIVO'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          FIN_DEL_ARCHIVO
+          cat > app/build.gradle <<'FIN_DEL_ARCHIVO'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'es.alarma.movimiento'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'es.alarma.movimiento'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          FIN_DEL_ARCHIVO
+          cat > app/src/main/AndroidManifest.xml <<'FIN_DEL_ARCHIVO'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:label="Alarma Movimiento"
+                  android:icon="@android:drawable/ic_lock_idle_alarm"
+                  android:theme="@android:style/Theme.DeviceDefault"
+                  android:allowBackup="false">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AlarmService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Alarma antirrobo que vigila el acelerometro con la pantalla apagada" />
+                  </service>
+              </application>
+          </manifest>
+          FIN_DEL_ARCHIVO
+          cat > app/src/main/java/es/alarma/movimiento/Siren.java <<'FIN_DEL_ARCHIVO'
+          package es.alarma.movimiento;
+
+          import android.content.Context;
+          import android.media.AudioAttributes;
+          import android.media.AudioFormat;
+          import android.media.AudioManager;
+          import android.media.AudioTrack;
+
+          /** Sirena generada por código que suena por el canal de ALARMA (salta aunque el móvil esté en silencio). */
+          public class Siren {
+              private static final int SR = 44100;
+
+              private final AudioManager audio;
+              private volatile boolean running = false;
+              private Thread thread;
+              private int savedVolume = -1;
+
+              public Siren(Context ctx) {
+                  audio = (AudioManager) ctx.getApplicationContext().getSystemService(Context.AUDIO_SERVICE);
+              }
+
+              public synchronized void start() {
+                  if (running) return;
+                  running = true;
+                  try {
+                      savedVolume = audio.getStreamVolume(AudioManager.STREAM_ALARM);
+                  } catch (Exception ignored) { savedVolume = -1; }
+                  thread = new Thread(this::loop, "siren");
+                  thread.start();
+              }
+
+              public synchronized void stop() {
+                  running = false;
+                  if (thread != null) {
+                      try { thread.join(1500); } catch (InterruptedException ignored) { }
+                      thread = null;
+                  }
+                  if (savedVolume >= 0) {
+                      try { audio.setStreamVolume(AudioManager.STREAM_ALARM, savedVolume, 0); } catch (Exception ignored) { }
+                      savedVolume = -1;
+                  }
+              }
+
+              private void forceMaxVolume() {
+                  try {
+                      int max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM);
+                      if (audio.getStreamVolume(AudioManager.STREAM_ALARM) < max) {
+                          audio.setStreamVolume(AudioManager.STREAM_ALARM, max, 0);
+                      }
+                  } catch (Exception ignored) { }
+              }
+
+              private static short[] buildBuffer() {
+                  // Barrido 650 Hz -> 1550 Hz -> 650 Hz en 1 segundo, mezcla de onda cuadrada y senoidal (muy audible).
+                  short[] buf = new short[SR];
+                  double phase = 0;
+                  for (int i = 0; i < SR; i++) {
+                      double t = (double) i / SR;
+                      double tri = t < 0.5 ? t * 2 : (1 - t) * 2;
+                      double f = 650 + 900 * tri;
+                      phase += 2 * Math.PI * f / SR;
+                      double s = Math.sin(phase);
+                      double sq = s >= 0 ? 1 : -1;
+                      double v = 0.6 * sq + 0.4 * s;
+                      buf[i] = (short) (v * 32000);
+                  }
+                  return buf;
+              }
+
+              private void loop() {
+                  AudioTrack track = null;
+                  try {
+                      short[] buf = buildBuffer();
+                      AudioAttributes attrs = new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                              .build();
+                      AudioFormat fmt = new AudioFormat.Builder()
+                              .setSampleRate(SR)
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                              .build();
+                      int minBuf = AudioTrack.getMinBufferSize(SR, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+                      track = new AudioTrack.Builder()
+                              .setAudioAttributes(attrs)
+                              .setAudioFormat(fmt)
+                              .setBufferSizeInBytes(Math.max(minBuf, SR / 2))
+                              .setTransferMode(AudioTrack.MODE_STREAM)
+                              .build();
+                      track.setVolume(1.0f);
+                      forceMaxVolume();
+                      track.play();
+                      int chunk = SR / 10;
+                      while (running) {
+                          for (int off = 0; off < buf.length && running; off += chunk) {
+                              track.write(buf, off, Math.min(chunk, buf.length - off));
+                          }
+                          // Si alguien baja el volumen con los botones, se vuelve a subir.
+                          forceMaxVolume();
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      if (track != null) {
+                          try { track.stop(); } catch (Exception ignored) { }
+                          track.release();
+                      }
+                  }
+              }
+          }
+          FIN_DEL_ARCHIVO
+          cat > app/src/main/java/es/alarma/movimiento/AlarmService.java <<'FIN_DEL_ARCHIVO'
+          package es.alarma.movimiento;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.hardware.Sensor;
+          import android.hardware.SensorEvent;
+          import android.hardware.SensorEventListener;
+          import android.hardware.SensorManager;
+          import android.media.AudioAttributes;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.SystemClock;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+
+          /**
+           * Servicio en primer plano: vigila el acelerómetro y el giroscopio con la pantalla apagada.
+           * Al detectar movimiento empieza una cuenta atrás; si el movimiento continúa, suena la sirena.
+           */
+          public class AlarmService extends Service implements SensorEventListener {
+
+              public static final int IDLE = 0, ARMING = 1, WATCHING = 2, COUNTDOWN = 3, RINGING = 4;
+
+              public static final String ACTION_START = "es.alarma.movimiento.START";
+              public static final String ACTION_STOP = "es.alarma.movimiento.STOP";
+              public static final String EXTRA_SENS = "sens";
+              public static final String EXTRA_DELAY = "delay";
+              public static final String EXTRA_GRACE = "grace";
+
+              // Estado compartido con la pantalla (mismo proceso).
+              public static volatile int state = IDLE;
+              public static volatile long armedAt = 0;
+              public static volatile long graceMs = 0;
+              public static volatile long firstMotion = 0;
+              public static volatile long delayMs = 5000;
+
+              private static final String CHANNEL = "alarma";
+              private static final int NOTIF_ID = 1;
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private SensorManager sensors;
+              private PowerManager.WakeLock wakeLock;
+              private Siren siren;
+              private Vibrator vibrator;
+
+              private float accelThr, gyroThr;
+              private long confirmMs;
+              private boolean confirmed;
+              private final float[] gravity = new float[3];
+              private boolean gravityReady = false;
+
+              private final Runnable tick = new Runnable() {
+                  @Override public void run() {
+                      long now = SystemClock.elapsedRealtime();
+                      if (state == ARMING && now - armedAt >= graceMs) {
+                          state = WATCHING;
+                          notifyText("Vigilando movimiento");
+                      } else if (state == COUNTDOWN && now - firstMotion >= delayMs) {
+                          if (confirmed) {
+                              startRinging();
+                          } else {
+                              state = WATCHING; // fue un golpe suelto: se ignora
+                          }
+                      }
+                      if (state != IDLE) handler.postDelayed(this, 200);
+                  }
+              };
+
+              @Override public IBinder onBind(Intent intent) { return null; }
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  sensors = (SensorManager) getSystemService(SENSOR_SERVICE);
+                  vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+                  siren = new Siren(this);
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  NotificationChannel ch = new NotificationChannel(CHANNEL, "Alarma de movimiento", NotificationManager.IMPORTANCE_LOW);
+                  ch.setShowBadge(false);
+                  nm.createNotificationChannel(ch);
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  String action = intent != null ? intent.getAction() : null;
+                  if (action == null || ACTION_STOP.equals(action)) {
+                      stopEverything();
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+
+                  // ACTION_START
+                  goForeground("Armando…");
+                  if (state != IDLE) return START_REDELIVER_INTENT;
+
+                  int sens = intent.getIntExtra(EXTRA_SENS, 6);         // 1..10
+                  int delayS = intent.getIntExtra(EXTRA_DELAY, 5);      // segundos
+                  int graceS = intent.getIntExtra(EXTRA_GRACE, 10);     // segundos
+
+                  accelThr = 2.0f - (sens - 1) * 0.18f;   // m/s²  (sens 10 ≈ 0,38)
+                  gyroThr = 0.60f - (sens - 1) * 0.055f;  // rad/s (sens 10 ≈ 0,105)
+                  delayMs = Math.max(1, delayS) * 1000L;
+                  confirmMs = Math.min(1500L, delayMs / 2);
+                  graceMs = Math.max(0, graceS) * 1000L;
+
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AlarmaMovimiento:vigilancia");
+                  wakeLock.acquire(24L * 60 * 60 * 1000);
+
+                  gravityReady = false;
+                  Sensor acc = sensors.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+                  Sensor gyr = sensors.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+                  if (acc != null) sensors.registerListener(this, acc, SensorManager.SENSOR_DELAY_GAME);
+                  if (gyr != null) sensors.registerListener(this, gyr, SensorManager.SENSOR_DELAY_GAME);
+
+                  armedAt = SystemClock.elapsedRealtime();
+                  state = ARMING;
+                  handler.removeCallbacks(tick);
+                  handler.post(tick);
+                  return START_REDELIVER_INTENT;
+              }
+
+              @Override
+              public void onSensorChanged(SensorEvent e) {
+                  if (state == IDLE || state == RINGING) return;
+                  boolean moved = false;
+                  float[] v = e.values;
+                  if (e.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+                      if (!gravityReady) {
+                          System.arraycopy(v, 0, gravity, 0, 3);
+                          gravityReady = true;
+                          return;
+                      }
+                      final float a = 0.9f;
+                      for (int i = 0; i < 3; i++) gravity[i] = a * gravity[i] + (1 - a) * v[i];
+                      float x = v[0] - gravity[0], y = v[1] - gravity[1], z = v[2] - gravity[2];
+                      moved = Math.sqrt(x * x + y * y + z * z) > accelThr;
+                  } else if (e.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+                      moved = Math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) > gyroThr;
+                  }
+                  if (!moved) return;
+
+                  long now = SystemClock.elapsedRealtime();
+                  if (state == WATCHING) {
+                      firstMotion = now;
+                      confirmed = false;
+                      state = COUNTDOWN;
+                  } else if (state == COUNTDOWN && now - firstMotion >= confirmMs) {
+                      confirmed = true; // el movimiento sigue: no es un golpe aislado
+                  }
+              }
+
+              @Override public void onAccuracyChanged(Sensor sensor, int accuracy) { }
+
+              private void startRinging() {
+                  state = RINGING;
+                  sensors.unregisterListener(this);
+                  siren.start();
+                  try {
+                      AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build();
+                      vibrator.vibrate(VibrationEffect.createWaveform(new long[]{0, 700, 300}, 0), attrs);
+                  } catch (Exception ignored) { }
+                  notifyText("¡ALARMA! Abre la app para pararla");
+              }
+
+              private void stopEverything() {
+                  handler.removeCallbacks(tick);
+                  if (sensors != null) sensors.unregisterListener(this);
+                  if (siren != null) siren.stop();
+                  if (vibrator != null) vibrator.cancel();
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  wakeLock = null;
+                  state = IDLE;
+                  stopForeground(STOP_FOREGROUND_REMOVE);
+              }
+
+              @Override
+              public void onDestroy() {
+                  stopEverything();
+                  super.onDestroy();
+              }
+
+              private Notification buildNotification(String text) {
+                  Intent open = new Intent(this, MainActivity.class)
+                          .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  // Sin botón de "parar" en la notificación: para desarmar hay que desbloquear el móvil.
+                  return new Notification.Builder(this, CHANNEL)
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle("Alarma de movimiento")
+                          .setContentText(text)
+                          .setContentIntent(pi)
+                          .setOngoing(true)
+                          .setVisibility(Notification.VISIBILITY_PUBLIC)
+                          .build();
+              }
+
+              private void goForeground(String text) {
+                  Notification n = buildNotification(text);
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+                  } else {
+                      startForeground(NOTIF_ID, n);
+                  }
+              }
+
+              private void notifyText(String text) {
+                  getSystemService(NotificationManager.class).notify(NOTIF_ID, buildNotification(text));
+              }
+          }
+          FIN_DEL_ARCHIVO
+          cat > app/src/main/java/es/alarma/movimiento/MainActivity.java <<'FIN_DEL_ARCHIVO'
+          package es.alarma.movimiento;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.os.SystemClock;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private SharedPreferences prefs;
+              private Siren testSiren;
+
+              private TextView status, sensLabel, delayLabel, graceLabel;
+              private SeekBar sens, delay, grace;
+              private Button arm, disarm, test, battery;
+
+              private final Runnable refresher = new Runnable() {
+                  @Override public void run() {
+                      refresh();
+                      handler.postDelayed(this, 300);
+                  }
+              };
+
+              private int dp(int v) { return Math.round(v * getResources().getDisplayMetrics().density); }
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  prefs = getSharedPreferences("ajustes", MODE_PRIVATE);
+                  testSiren = new Siren(this);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(20), dp(24), dp(20), dp(24));
+
+                  status = new TextView(this);
+                  status.setTextSize(26);
+                  status.setTypeface(Typeface.DEFAULT_BOLD);
+                  status.setGravity(Gravity.CENTER);
+                  status.setPadding(0, dp(16), 0, dp(24));
+                  root.addView(status);
+
+                  sensLabel = new TextView(this);
+                  root.addView(sensLabel);
+                  sens = slider(1, 10, prefs.getInt("sens", 6));
+                  root.addView(sens);
+
+                  delayLabel = new TextView(this);
+                  root.addView(delayLabel);
+                  delay = slider(1, 30, prefs.getInt("delay", 5));
+                  root.addView(delay);
+
+                  graceLabel = new TextView(this);
+                  root.addView(graceLabel);
+                  grace = slider(0, 60, prefs.getInt("grace", 10));
+                  root.addView(grace);
+
+                  arm = button("ARMAR");
+                  arm.setOnClickListener(v -> armAlarm());
+                  root.addView(arm);
+
+                  disarm = button("DESARMAR / PARAR");
+                  disarm.setOnClickListener(v -> stopAlarm());
+                  root.addView(disarm);
+
+                  test = button("Probar sirena (2 s, ¡suena fuerte!)");
+                  test.setOnClickListener(v -> {
+                      testSiren.start();
+                      handler.postDelayed(testSiren::stop, 2000);
+                  });
+                  root.addView(test);
+
+                  battery = button("Evitar que el sistema cierre la app");
+                  battery.setOnClickListener(v -> askBatteryExemption());
+                  root.addView(battery);
+
+                  TextView help = new TextView(this);
+                  help.setPadding(0, dp(20), 0, 0);
+                  help.setText("Cómo funciona: pulsa ARMAR, deja el móvil quieto y apaga la pantalla. "
+                          + "Tras el tiempo para colocarlo, empieza a vigilar. Si se mueve y el movimiento "
+                          + "continúa durante el retraso elegido, suena una sirena al máximo volumen "
+                          + "(aunque esté en silencio). Para pararla hay que desbloquear el móvil y pulsar DESARMAR.");
+                  root.addView(help);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(root);
+                  setContentView(scroll);
+
+                  if (Build.VERSION.SDK_INT >= 33
+                          && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
+                  }
+                  updateLabels();
+              }
+
+              private SeekBar slider(int min, int max, int value) {
+                  SeekBar s = new SeekBar(this);
+                  s.setMin(min);
+                  s.setMax(max);
+                  s.setProgress(value);
+                  s.setPadding(dp(8), dp(8), dp(8), dp(20));
+                  s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                      @Override public void onProgressChanged(SeekBar b, int p, boolean fromUser) { updateLabels(); }
+                      @Override public void onStartTrackingTouch(SeekBar b) { }
+                      @Override public void onStopTrackingTouch(SeekBar b) { saveSettings(); }
+                  });
+                  return s;
+              }
+
+              private Button button(String text) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setAllCaps(false);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                  lp.topMargin = dp(10);
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              private void updateLabels() {
+                  sensLabel.setText("Sensibilidad: " + sens.getProgress() + " / 10");
+                  delayLabel.setText("Retraso antes de sonar: " + delay.getProgress() + " s");
+                  graceLabel.setText("Tiempo para dejarlo quieto tras armar: " + grace.getProgress() + " s");
+              }
+
+              private void saveSettings() {
+                  prefs.edit()
+                          .putInt("sens", sens.getProgress())
+                          .putInt("delay", delay.getProgress())
+                          .putInt("grace", grace.getProgress())
+                          .apply();
+              }
+
+              private void armAlarm() {
+                  saveSettings();
+                  Intent i = new Intent(this, AlarmService.class)
+                          .setAction(AlarmService.ACTION_START)
+                          .putExtra(AlarmService.EXTRA_SENS, sens.getProgress())
+                          .putExtra(AlarmService.EXTRA_DELAY, delay.getProgress())
+                          .putExtra(AlarmService.EXTRA_GRACE, grace.getProgress());
+                  startForegroundService(i);
+              }
+
+              private void stopAlarm() {
+                  startService(new Intent(this, AlarmService.class).setAction(AlarmService.ACTION_STOP));
+              }
+
+              private void askBatteryExemption() {
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  if (pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                      battery.setText("✓ Ya está excluida del ahorro de batería");
+                      return;
+                  }
+                  try {
+                      startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                              Uri.parse("package:" + getPackageName())));
+                  } catch (Exception e) {
+                      startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+                  }
+              }
+
+              private void refresh() {
+                  int s = AlarmService.state;
+                  long now = SystemClock.elapsedRealtime();
+                  switch (s) {
+                      case AlarmService.ARMING: {
+                          long left = Math.max(0, (AlarmService.graceMs - (now - AlarmService.armedAt) + 999) / 1000);
+                          status.setText("Armando… déjalo quieto (" + left + " s)");
+                          status.setTextColor(Color.rgb(230, 160, 0));
+                          break;
+                      }
+                      case AlarmService.WATCHING:
+                          status.setText("🔒 Vigilando");
+                          status.setTextColor(Color.rgb(40, 170, 80));
+                          break;
+                      case AlarmService.COUNTDOWN: {
+                          long left = Math.max(0, (AlarmService.delayMs - (now - AlarmService.firstMotion) + 999) / 1000);
+                          status.setText("Movimiento detectado… " + left + " s");
+                          status.setTextColor(Color.rgb(230, 120, 0));
+                          break;
+                      }
+                      case AlarmService.RINGING:
+                          status.setText("🚨 ¡ALARMA!");
+                          status.setTextColor(Color.rgb(220, 40, 40));
+                          break;
+                      default:
+                          status.setText("Desarmada");
+                          status.setTextColor(Color.GRAY);
+                  }
+                  boolean idle = s == AlarmService.IDLE;
+                  arm.setEnabled(idle);
+                  sens.setEnabled(idle);
+                  delay.setEnabled(idle);
+                  grace.setEnabled(idle);
+                  test.setEnabled(idle);
+                  disarm.setVisibility(idle ? View.GONE : View.VISIBLE);
+              }
+
+              @Override protected void onResume() { super.onResume(); handler.post(refresher); }
+              @Override protected void onPause() { super.onPause(); handler.removeCallbacks(refresher); }
+              @Override protected void onDestroy() { testSiren.stop(); super.onDestroy(); }
+          }
+          FIN_DEL_ARCHIVO
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AlarmaMovimiento-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
